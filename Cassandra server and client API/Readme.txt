@@ -1,6 +1,6 @@
-Read the specification document thoroughly at: https://courses.engr.illinois.edu/cs425/fa2014/assignments.html
 
-Create a high level design covering all scenarios / test cases before you start coding. 
+Implements Casandra API to ensure reliabilty and data consitency under failure and network outages
+Read the specification document thoroughly at: https://courses.engr.illinois.edu/cs425/fa2014/assignments.html
 
 How do I run only the CRUD tests ? 
 
