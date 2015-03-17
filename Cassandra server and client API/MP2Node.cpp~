@@ -1,0 +1,939 @@
+/**********************************
+ * FILE NAME: MP2Node.cpp
+ *
+ * DESCRIPTION: MP2Node class definition
+ **********************************/
+#include "MP2Node.h"
+
+/**
+ * constructor
+ */
+MP2Node::MP2Node(Member *memberNode, Params *par, EmulNet * emulNet, Log * log, Address * address) 
+{
+	this->memberNode = memberNode;
+	this->par = par;
+	this->emulNet = emulNet;
+	this->log = log;
+	ht = new HashTable();
+	this->memberNode->addr = *address;
+
+	int i;
+	for(i = 0; i < 4000; i++)
+	{
+		log_block[i][0] = i;	//id
+		log_block[i][1] = -1;	//time
+		log_block[i][2] = -1;	//type 1->C 2->R 3->U 4->D
+		log_block[i][3] = -1;	//status 0->incomplete 1->complete 2->failed
+		log_block[i][4] = -1;	//ack	0->nack 1->ack 2->expecting
+		log_block[i][5] = -1;	//ack
+		log_block[i][6] = -1;	//ack
+	}
+}
+
+/**
+ * Destructor
+ */
+MP2Node::~MP2Node() 
+{
+	delete ht;
+	delete memberNode;
+}
+
+/**
+ * FUNCTION NAME: updateRing
+ *
+ * DESCRIPTION: This function does the following:
+ * 				1) Gets the current membership list from the Membership Protocol (MP1Node)
+ * 				   The membership list is returned as a vector of Nodes. See Node class in Node.h
+ * 				2) Constructs the ring based on the membership list
+ * 				3) Calls the Stabilization Protocol
+ */
+void MP2Node::updateRing() {
+	/*
+	 * Implement this. Parts of it are already implemented
+	 */
+	vector<Node> curMemList;
+	bool change = false;
+
+	/*
+	 *  Step 1. Get the current membership list from Membership Protocol / MP1
+	 */
+	curMemList = getMembershipList();
+
+	/*
+	 * Step 2: Construct the ring
+	 */
+	// Sort the list based on the hashCode
+	sort(curMemList.begin(), curMemList.end());
+
+
+	/*
+	 * Step 3: Run the stabilization protocol IF REQUIRED
+	 */
+	// Run stabilization protocol if the hash table size is greater than zero and if there has been a changed in the ring
+	// TODO actually implement
+	int flag = 0;
+	if(ring.size() != curMemList.size())
+		flag = 1;
+
+	ring = curMemList;
+
+	//if(flag == 1)
+	//	stabilizationProtocol();
+}
+
+/**
+ * FUNCTION NAME: getMemberhipList
+ *
+ * DESCRIPTION: This function goes through the membership list from the Membership protocol/MP1 and
+ * 				i) generates the hash code for each member
+ * 				ii) populates the ring member in MP2Node class
+ * 				It returns a vector of Nodes. Each element in the vector contain the following fields:
+ * 				a) Address of the node
+ * 				b) Hash code obtained by consistent hashing of the Address
+ */
+vector<Node> MP2Node::getMembershipList() {
+	unsigned int i;
+	vector<Node> curMemList;
+	for ( i = 0 ; i < this->memberNode->memberList.size(); i++ ) {
+		Address addressOfThisMember;
+		int id = this->memberNode->memberList.at(i).getid();
+		short port = this->memberNode->memberList.at(i).getport();
+		memcpy(&addressOfThisMember.addr[0], &id, sizeof(int));
+		memcpy(&addressOfThisMember.addr[4], &port, sizeof(short));
+		curMemList.emplace_back(Node(addressOfThisMember));
+	}
+	return curMemList;
+}
+
+/**
+ * FUNCTION NAME: hashFunction
+ *
+ * DESCRIPTION: This functions hashes the key and returns the position on the ring
+ * 				HASH FUNCTION USED FOR CONSISTENT HASHING
+ *
+ * RETURNS:
+ * size_t position on the ring
+ */
+size_t MP2Node::hashFunction(string key) {
+	std::hash<string> hashFunc;
+	size_t ret = hashFunc(key);
+	return ret%RING_SIZE;
+}
+
+/**
+ * FUNCTION NAME: clientCreate
+ *
+ * DESCRIPTION: client side CREATE API
+ * 				The function does the following:
+ * 				1) Constructs the message
+ * 				2) Finds the replicas of this key
+ * 				3) Sends a message to the replica
+ */
+void MP2Node::clientCreate(string key, string value) 
+{
+	/********** CONSTRUCT ************/
+	//First of all, lets create the message!
+	//Signature of message -
+	//Message(int _transID, Address _fromAddr, MessageType _type, string _key, string _value, ReplicaType _replica);
+	
+	//Increment the global transID!
+	g_transID++;
+	
+	Address addr = this->memberNode->addr;
+
+	Message first_message(g_transID, addr, CREATE, key, value, PRIMARY);
+	Message second_message(g_transID, addr, CREATE, key, value, SECONDARY);
+	Message third_message(g_transID, addr, CREATE, key, value, TERTIARY);
+
+	//Let's take care of indexes now.
+	//First get hask of the key.
+	size_t key_hash = hashFunction(key);
+
+	//Now according to http://youtu.be/B_HTdrTgGNs,
+	//DHT determins the shard. So, here we go -
+	int primary_ring_index = 0;
+
+	int i;
+	for(i = 0; i < ring.size(); i++)
+	{
+		if(ring[i].getHashCode() >= key_hash)
+		{
+			primary_ring_index = i;
+			break;
+		}
+	}
+
+	/*********** REPLICAS **********/
+	//With primary_ring_index set, now it's time to make the replicas.
+	//And, since the replication factor is 3, we need to make 2 replicas!
+	int replica_one_index;
+	int replica_two_index;
+
+	//Now in order to set the index of these two replicas, we have to determine the size of the ring.
+	if(ring.size() - primary_ring_index > 2)
+	{
+		replica_one_index = primary_ring_index + 1;
+		replica_two_index = primary_ring_index + 2;
+	}
+
+	else if(ring.size() - primary_ring_index == 2)
+	{
+		replica_one_index = primary_ring_index + 1;
+		replica_two_index = 0;
+	}
+
+	else if(ring.size() > 1)
+	{
+		replica_one_index = 0;
+		replica_two_index = 1;
+	}
+
+	else
+	{
+		replica_one_index = primary_ring_index;
+		replica_two_index = primary_ring_index;
+	}
+
+	/*********** LOG ************/
+	log_block[g_transID][0] = g_transID;
+	log_block[g_transID][1] = par->getcurrtime();
+	log_block[g_transID][2] = 1; 	//type
+	log_block[g_transID][3] = 0;	//status
+	log_block[g_transID][4] = 2;	//ack
+	log_block[g_transID][5] = 2;	//ack
+	log_block[g_transID][6] = 2; 	//ack
+
+	kv_block[g_transID][0] = g_transID;
+	kv_block[g_transID][1] = key;
+	kv_block[g_transID][2] = value;
+
+	/*********** SEND ***********/
+	//Now, lets send the message!
+	emulNet->ENsend(&addr, ring[primary_ring_index].getAddress(), first_message.toString());
+	emulNet->ENsend(&addr, ring[replica_one_index].getAddress(),  second_message.toString());
+	emulNet->ENsend(&addr, ring[replica_two_index].getAddress(),  third_message.toString());
+}
+
+/**
+ * FUNCTION NAME: clientRead
+ *
+ * DESCRIPTION: client side READ API
+ * 				The function does the following:
+ * 				1) Constructs the message
+ * 				2) Finds the replicas of this key
+ * 				3) Sends a message to the replica
+ */
+void MP2Node::clientRead(string key)
+{
+	/********** CONSTRUCT ************/
+	//First of all, lets create the message!
+	//Signature of message -
+	//Message(int _transID, Address _fromAddr, MessageType _type, string _key, string _value, ReplicaType _replica);
+	g_transID++;
+	Address addr = this->memberNode->addr;
+
+	Message first_message(g_transID, addr, READ, key);
+	Message second_message(g_transID, addr, READ, key);
+	Message third_message(g_transID, addr, READ, key);
+
+	//Let's take care of indexes now.
+	//First get hask of the key.
+	size_t key_hash = hashFunction(key);
+
+	//Now according to http://youtu.be/B_HTdrTgGNs,
+	//DHT determins the shard. So, here we go -
+	int primary_ring_index = 0;
+
+	int i;
+	for(i = 0; i < ring.size(); i++)
+	{
+		if(ring[i].getHashCode() >= key_hash)
+		{
+			primary_ring_index = i;
+			break;
+		}
+	}
+
+	/*********** REPLICAS **********/
+	//With primary_ring_index set, now it's time to make the replicas.
+	//And, since the replication factor is 3, we need to make 2 replicas!
+	int replica_one_index;
+	int replica_two_index;
+
+	//Now in order to set the index of these two replicas, we have to determine the size of the ring.
+	if(ring.size() - primary_ring_index > 2)
+	{
+		replica_one_index = primary_ring_index + 1;
+		replica_two_index = primary_ring_index + 2;
+	}
+
+	else if(ring.size() - primary_ring_index == 2)
+	{
+		replica_one_index = primary_ring_index + 1;
+		replica_two_index = 0;
+	}
+
+	else if(ring.size() > 1)
+	{
+		replica_one_index = 0;
+		replica_two_index = 1;
+	}
+
+	else
+	{
+		replica_one_index = primary_ring_index;
+		replica_two_index = primary_ring_index;
+	}
+
+	/*********** LOG ************/
+	log_block[g_transID][0] = g_transID;
+	log_block[g_transID][1] = par->getcurrtime();
+	log_block[g_transID][2] = 2; 	//type
+	log_block[g_transID][3] = 0;	//status
+	log_block[g_transID][4] = 2;	//ack
+	log_block[g_transID][5] = 2;	//ack
+	log_block[g_transID][6] = 2; 	//ack
+
+	kv_block[g_transID][0] = g_transID;
+	kv_block[g_transID][1] = key;
+
+	/*********** SEND ***********/
+	//Now, lets send the message!
+	emulNet->ENsend(&addr, ring[primary_ring_index].getAddress(), first_message.toString());
+	emulNet->ENsend(&addr, ring[replica_one_index].getAddress(),  second_message.toString());
+	emulNet->ENsend(&addr, ring[replica_two_index].getAddress(),  third_message.toString());
+}
+
+/**
+ * FUNCTION NAME: clientUpdate
+ *
+ * DESCRIPTION: client side UPDATE API
+ * 				The function does the following:
+ * 				1) Constructs the message
+ * 				2) Finds the replicas of this key
+ * 				3) Sends a message to the replica
+ */
+void MP2Node::clientUpdate(string key, string value)
+{
+	/********** CONSTRUCT ************/
+	//First of all, lets create the message!
+	//Signature of message -
+	//Message(int _transID, Address _fromAddr, MessageType _type, string _key, string _value, ReplicaType _replica);
+	g_transID++;
+	Address addr = this->memberNode->addr;
+
+	Message first_message(g_transID, addr, UPDATE, key, value, PRIMARY);
+	Message second_message(g_transID, addr, UPDATE, key, value, SECONDARY);
+	Message third_message(g_transID, addr, UPDATE, key, value, TERTIARY);
+
+	//Let's take care of indexes now.
+	//First get hask of the key.
+	size_t key_hash = hashFunction(key);
+
+	//Now according to http://youtu.be/B_HTdrTgGNs,
+	//DHT determins the shard. So, here we go -
+	int primary_ring_index = 0;
+
+	int i;
+	for(i = 0; i < ring.size(); i++)
+	{
+		if(ring[i].getHashCode() >= key_hash)
+		{
+			primary_ring_index = i;
+			break;
+		}
+	}
+
+	/*********** REPLICAS **********/
+	//With primary_ring_index set, now it's time to make the replicas.
+	//And, since the replication factor is 3, we need to make 2 replicas!
+	int replica_one_index;
+	int replica_two_index;
+
+	//Now in order to set the index of these two replicas, we have to determine the size of the ring.
+	if(ring.size() - primary_ring_index > 2)
+	{
+		replica_one_index = primary_ring_index + 1;
+		replica_two_index = primary_ring_index + 2;
+	}
+
+	else if(ring.size() - primary_ring_index == 2)
+	{
+		replica_one_index = primary_ring_index + 1;
+		replica_two_index = 0;
+	}
+
+	else if(ring.size() > 1)
+	{
+		replica_one_index = 0;
+		replica_two_index = 1;
+	}
+
+	else
+	{
+		replica_one_index = primary_ring_index;
+		replica_two_index = primary_ring_index;
+	}
+
+	/*********** LOG ************/
+	log_block[g_transID][0] = g_transID;
+	log_block[g_transID][1] = par->getcurrtime();
+	log_block[g_transID][2] = 3; 	//type
+	log_block[g_transID][3] = 0;	//status
+	log_block[g_transID][4] = 2;	//ack
+	log_block[g_transID][5] = 2;	//ack
+	log_block[g_transID][6] = 2; 	//ack
+
+	kv_block[g_transID][0] = g_transID;
+	kv_block[g_transID][1] = key;
+	kv_block[g_transID][2] = value;
+
+	/*********** SEND ***********/
+	//Now, lets send the message!
+	emulNet->ENsend(&addr, ring[primary_ring_index].getAddress(), first_message.toString());
+	emulNet->ENsend(&addr, ring[replica_one_index].getAddress(),  second_message.toString());
+	emulNet->ENsend(&addr, ring[replica_two_index].getAddress(),  third_message.toString());
+
+}
+
+/**
+ * FUNCTION NAME: clientDelete
+ *
+ * DESCRIPTION: client side DELETE API
+ * 				The function does the following:
+ * 				1) Constructs the message
+ * 				2) Finds the replicas of this key
+ * 				3) Sends a message to the replica
+ */
+void MP2Node::clientDelete(string key)
+{
+	/********** CONSTRUCT ************/
+	//First of all, lets create the message!
+	//Signature of message -
+	//Message(int _transID, Address _fromAddr, MessageType _type, string _key, string _value, ReplicaType _replica);
+	g_transID++;
+	Address addr = this->memberNode->addr;
+
+	Message first_message(g_transID, addr, DELETE, key);
+	Message second_message(g_transID, addr, DELETE, key);
+	Message third_message(g_transID, addr, DELETE, key);
+
+	//Let's take care of indexes now.
+	//First get hask of the key.
+	size_t key_hash = hashFunction(key);
+
+	//Now according to http://youtu.be/B_HTdrTgGNs,
+	//DHT determins the shard. So, here we go -
+	int primary_ring_index = 0;
+
+	int i;
+	for(i = 0; i < ring.size(); i++)
+	{
+		if(ring[i].getHashCode() >= key_hash)
+		{
+			primary_ring_index = i;
+			break;
+		}
+	}
+
+	/*********** REPLICAS **********/
+	//With primary_ring_index set, now it's time to make the replicas.
+	//And, since the replication factor is 3, we need to make 2 replicas!
+	int replica_one_index;
+	int replica_two_index;
+
+	//Now in order to set the index of these two replicas, we have to determine the size of the ring.
+	if(ring.size() - primary_ring_index > 2)
+	{
+		replica_one_index = primary_ring_index + 1;
+		replica_two_index = primary_ring_index + 2;
+	}
+
+	else if(ring.size() - primary_ring_index == 2)
+	{
+		replica_one_index = primary_ring_index + 1;
+		replica_two_index = 0;
+	}
+
+	else if(ring.size() > 1)
+	{
+		replica_one_index = 0;
+		replica_two_index = 1;
+	}
+
+	else
+	{
+		replica_one_index = primary_ring_index;
+		replica_two_index = primary_ring_index;
+	}
+
+	/*********** LOG ************/
+	log_block[g_transID][0] = g_transID;
+	log_block[g_transID][1] = par->getcurrtime();
+	log_block[g_transID][2] = 4; 	//type
+	log_block[g_transID][3] = 0;	//status
+	log_block[g_transID][4] = 2;	//ack
+	log_block[g_transID][5] = 2;	//ack
+	log_block[g_transID][6] = 2; 	//ack
+
+	kv_block[g_transID][0] = g_transID;
+	kv_block[g_transID][1] = key;
+
+	/*********** SEND ***********/
+	//Now, lets send the message!
+	emulNet->ENsend(&addr, ring[primary_ring_index].getAddress(), first_message.toString());
+	emulNet->ENsend(&addr, ring[replica_one_index].getAddress(),  second_message.toString());
+	emulNet->ENsend(&addr, ring[replica_two_index].getAddress(),  third_message.toString());
+}
+
+/**
+ * FUNCTION NAME: createKeyValue
+ *
+ * DESCRIPTION: Server side CREATE API
+ * 			   	The function does the following:
+ * 			   	1) Inserts key value into the local hash table
+ * 			   	2) Return true or false based on success or failure
+ */
+bool MP2Node::createKeyValue(string key, string value, ReplicaType replica) 
+{
+	// Insert key, value, replicaType into the hash table
+	all_keys.push_back(key);
+	Entry entry(value, par->getcurrtime(), replica);
+	bool success = ht->create(key, entry.convertToString());
+	return success;
+}
+
+/**
+ * FUNCTION NAME: readKey
+ *
+ * DESCRIPTION: Server side READ API
+ * 			    This function does the following:
+ * 			    1) Read key from local hash table
+ * 			    2) Return value
+ */
+string MP2Node::readKey(string key) 
+{
+	// Read key from local hash table and return value
+	string ht_value = ht->read(key);
+	
+	if(ht_value != "")
+	{
+		Entry entry(ht_value);
+		string return_value = entry.value;
+		return return_value;
+	}
+	else
+		return "";
+}
+
+/**
+ * FUNCTION NAME: updateKeyValue
+ *
+ * DESCRIPTION: Server side UPDATE API
+ * 				This function does the following:
+ * 				1) Update the key to the new value in the local hash table
+ * 				2) Return true or false based on success or failure
+ */
+bool MP2Node::updateKeyValue(string key, string value, ReplicaType replica) 
+{
+	// Update key in local hash table and return true or false
+	Entry entry(value, par->getcurrtime(), replica);
+	all_keys.push_back(key);
+	bool success = ht->update(key, entry.convertToString());
+	return success;
+}
+
+/**
+ * FUNCTION NAME: deleteKey
+ *
+ * DESCRIPTION: Server side DELETE API
+ * 				This function does the following:
+ * 				1) Delete the key from the local hash table
+ * 				2) Return true or false based on success or failure
+ */
+bool MP2Node::deletekey(string key) 
+{
+	// Delete the key from the local hash table
+	bool success = ht->deleteKey(key);
+	return success;
+}
+
+/**
+ * FUNCTION NAME: checkMessages
+ *
+ * DESCRIPTION: This function is the message handler of this node.
+ * 				This function does the following:
+ * 				1) Pops messages from the queue
+ * 				2) Handles the messages according to message types
+ */
+void MP2Node::checkMessages() 
+{
+	char * data;
+	int size;
+
+	// dequeue all messages and handle them
+	int i;
+	for(i = 0; i < 4000; i++)
+	{
+		if(log_block[i][3] == 0 && (par->getcurrtime() - log_block[i][1] > 10))
+		{
+			cout << "TIMEOUT" << endl;
+			log_block[i][3] = 2;
+
+			if(log_block[i][2] == 1)
+				log->logCreateFail(&this->memberNode->addr, true, i, kv_block[i][1], kv_block[i][2]);
+			if(log_block[i][2] == 2)
+				log->logReadFail(&this->memberNode->addr, true, i, kv_block[i][1]);
+			if(log_block[i][2] == 3)
+				log->logUpdateFail(&this->memberNode->addr, true, i, kv_block[i][1], kv_block[i][2]);
+			if(log_block[i][2] == 4)
+				log->logDeleteFail(&this->memberNode->addr, true, i, kv_block[i][1]);
+		}
+	}
+
+	while ( !memberNode->mp2q.empty() ) 
+	{
+		/*
+		 * Pop a message from the queue
+		 */
+		data = (char *)memberNode->mp2q.front().elt;
+		size = memberNode->mp2q.front().size;
+		memberNode->mp2q.pop();
+
+		string message(data, data + size);
+
+		/*
+		 * Handle the message types here
+		 */
+		Message msg(message);
+		string key           = msg.key;
+		string value         = msg.value;
+		Address from_addr    = msg.fromAddr;
+		MessageType msg_type = msg.type;
+		ReplicaType rep_type = msg.replica;
+		int transID          = msg.transID;
+		bool success         = msg.success;
+		bool is_coordinator  = false;
+
+		if(msg_type == CREATE)
+		{
+			bool created = createKeyValue(key, value, rep_type);
+			if(created)
+				log->logCreateSuccess(&this->memberNode->addr, is_coordinator, transID, key, value);
+			else
+				log->logCreateFail(&this->memberNode->addr, is_coordinator, transID, key, value);
+			
+			Message reply(transID, this->memberNode->addr, REPLY, created);
+			emulNet->ENsend(&this->memberNode->addr, &from_addr, reply.toString());
+		}
+
+		if(msg_type == READ)
+		{
+			string val = readKey(key);
+
+			bool read;
+			if(val == "")
+				read = false;
+			else
+				read = true;
+			
+			if(read)
+				log->logReadSuccess(&this->memberNode->addr, is_coordinator, transID, key, val);
+			else
+				log->logReadFail(&this->memberNode->addr, is_coordinator, transID, key);
+		
+			Message readReply(transID, this->memberNode->addr, val);
+			emulNet->ENsend(&this->memberNode->addr, &from_addr, readReply.toString());
+		}
+
+		if(msg_type == UPDATE)
+		{
+			bool updated = updateKeyValue(key, value, rep_type);
+			if(updated)
+				log->logUpdateSuccess(&this->memberNode->addr, is_coordinator, transID, key, value);
+			else
+				log->logUpdateFail(&this->memberNode->addr, is_coordinator, transID, key, value);
+
+			Message reply(transID, this->memberNode->addr, REPLY, updated);
+			emulNet->ENsend(&this->memberNode->addr, &from_addr, reply.toString());
+		}
+
+		if(msg_type == DELETE)
+		{
+			bool deleted = deletekey(key);
+			if(deleted)
+				log->logDeleteSuccess(&this->memberNode->addr, is_coordinator, transID, key);
+			else
+				log->logDeleteFail(&this->memberNode->addr, is_coordinator, transID, key);
+
+			Message reply(transID, this->memberNode->addr, REPLY, deleted);
+			emulNet->ENsend(&this->memberNode->addr, &from_addr, reply.toString());
+		}
+
+		if(msg_type == REPLY && log_block[transID][3] == 0)
+		{
+			/* Quorum */
+			int i;
+			for(i = 4; i <= 6; i++)
+			{
+				if(log_block[transID][i] == 2 && success == true)
+				{
+					log_block[transID][i] = 1;		//Yay! First ack!
+					//cout << "ACK" << endl;
+					break;							//Coz we dont' want it to ack multiple times.
+				}
+
+				if(log_block[transID][i] == 2 && success == false)
+				{
+					log_block[transID][i] = 0;		//Yay! First nack!
+					break;							//Coz we dont' want it to nack multiple times.
+				}
+			}
+
+			bool this_success = false;;
+			if(success)
+			{
+				//cout << "ENTERED" << endl;
+				int i;
+				for(i = 4; i <= 6; i++)
+				{
+					if(log_block[transID][i] == 1)	//there was an ack before as well
+					{
+						this_success = true;		//as it has reached > 51% favoring votes
+						//cout << "SUCCES LOL" << endl;
+					}
+
+				}
+			}
+			else
+			{
+				int i;
+				for(i = 4; i <= 6; i++)
+				{
+					if(log_block[transID][i] == 0)	//there was an nack before as well
+					{
+						this_success = false;		//as it has reached > 51% non-favoring votes
+						//cout << "fail LOL" << endl;
+					}
+				}	
+			}
+
+			/* Reply */
+			if(this_success)
+			{
+				if(log_block[transID][2] == 1  && transID != 0)
+					log->logCreateSuccess(&this->memberNode->addr, true, transID, kv_block[transID][1], kv_block[transID][2]);
+				else if(log_block[transID][2] == 3)
+					log->logUpdateSuccess(&this->memberNode->addr, true, transID, kv_block[transID][1], kv_block[transID][2]);
+				else if (log_block[transID][2] == 4  && transID != 0)
+					log->logDeleteSuccess(&this->memberNode->addr, true, transID, kv_block[transID][1]);
+
+				log_block[transID][3] = 1;
+			}
+			else
+			{
+				if(log_block[transID][2] == 1  && transID != 0)
+					log->logCreateFail(&this->memberNode->addr, true, transID, kv_block[transID][1], kv_block[transID][2]);
+				if(log_block[transID][2] == 3)
+					log->logUpdateFail(&this->memberNode->addr, true, transID, kv_block[transID][1], kv_block[transID][2]);
+				else if (log_block[transID][2] == 4  && transID != 0)
+					log->logDeleteFail(&this->memberNode->addr, true, transID, kv_block[transID][1]);
+
+				log_block[transID][3] = 2;
+			}
+
+		}
+
+		if(msg_type == READREPLY && log_block[transID][3] == 0)
+		{
+			/* Quorum */
+			int i;
+			for(i = 4; i <= 6; i++)
+			{
+				if(log_block[transID][i] == 2 && value != "")
+				{
+					log_block[transID][i] = 1;		//Yay! First ack!
+					break;							//Coz we dont' want it to ack multiple times.
+				}
+
+				if(log_block[transID][i] == 2 && value == "")
+				{
+					log_block[transID][i] = 0;		//Yay! First nack!
+					break;							//Coz we dont' want it to nack multiple times.
+				}
+			}
+			bool this_success;
+			if(value != "")
+			{
+				int i;
+				for(i = 4; i <= 6; i++)
+				{
+					if(log_block[transID][i] == 1)	//there was an ack before as well
+						this_success = true;		//as it has reached > 51% favoring votes
+				}
+			}
+			else
+			{
+				int i;
+				for(i = 4; i <= 6; i++)
+				{
+					if(log_block[transID][i] == 0)	//there was an nack before as well
+						this_success = false;		//as it has reached > 51% non-favoring votes
+				}	
+			}
+
+			/* ReadReply */
+			if(this_success)
+			{
+				log->logReadSuccess(&this->memberNode->addr, true, transID, kv_block[transID][1], value);
+				log_block[transID][3] = 1;
+			}
+			else
+			{
+				log->logReadFail(&this->memberNode->addr, true, transID, kv_block[transID][1]);
+				log_block[transID][3] = 2;
+			}
+		}
+	}
+}
+
+/**
+ * FUNCTION NAME: findNodes
+ *
+ * DESCRIPTION: Find the replicas of the given keyfunction
+ * 				This function is responsible for finding the replicas of a key
+ */
+vector<Node> MP2Node::findNodes(string key) 
+{
+	size_t pos = hashFunction(key);
+	vector<Node> addr_vec;
+	if (ring.size() >= 3) {
+		// if pos <= min || pos > max, the leader is the min
+		if (pos <= ring.at(0).getHashCode() || pos > ring.at(ring.size()-1).getHashCode()) {
+			addr_vec.emplace_back(ring.at(0));
+			addr_vec.emplace_back(ring.at(1));
+			addr_vec.emplace_back(ring.at(2));
+		}
+		else {
+			// go through the ring until pos <= node
+			for (int i=1; i<ring.size(); i++){
+				Node addr = ring.at(i);
+				if (pos <= addr.getHashCode()) {
+					addr_vec.emplace_back(addr);
+					addr_vec.emplace_back(ring.at((i+1)%ring.size()));
+					addr_vec.emplace_back(ring.at((i+2)%ring.size()));
+					break;
+				}
+			}
+		}
+	}
+	return addr_vec;
+}
+
+/**
+ * FUNCTION NAME: recvLoop
+ *
+ * DESCRIPTION: Receive messages from EmulNet and push into the queue (mp2q)
+ */
+bool MP2Node::recvLoop() {
+    if ( memberNode->bFailed ) {
+    	return false;
+    }
+    else {
+    	return emulNet->ENrecv(&(memberNode->addr), this->enqueueWrapper, NULL, 1, &(memberNode->mp2q));
+    }
+}
+
+/**
+ * FUNCTION NAME: enqueueWrapper
+ *
+ * DESCRIPTION: Enqueue the message from Emulnet into the queue of MP2Node
+ */
+int MP2Node::enqueueWrapper(void *env, char *buff, int size) {
+	Queue q;
+	return q.enqueue((queue<q_elt> *)env, (void *)buff, size);
+}
+/**
+ * FUNCTION NAME: stabilizationProtocol
+ *
+ * DESCRIPTION: This runs the stabilization protocol in case of Node joins and leaves
+ * 				It ensures that there always 3 copies of all keys in the DHT at all times
+ * 				The function does the following:
+ *				1) Ensures that there are three "CORRECT" replicas of all the keys in spite of failures and joins
+ *				Note:- "CORRECT" replicas implies that every key is replicated in its two neighboring nodes in the ring
+ */
+void MP2Node::stabilizationProtocol() 
+{
+	//ring = curMemList;
+
+	int i;
+	/*
+	for(i = 0; i < all_keys.size(); i++)
+	{
+		Entry entry(ht->read(all_keys.at(i)));
+		string key = all_keys.at(i);
+		size_t key_hash = hashFunction(key);
+		string val = entry.value;
+
+		//Now according to http://youtu.be/B_HTdrTgGNs,
+		//DHT determins the shard. So, here we go -
+		int primary_ring_index = 0;
+
+		int j;
+		for(j = 0; j < ring.size(); j++)
+		{
+			if(ring[j].getHashCode() >= key_hash)
+			{
+				primary_ring_index = j;
+				break;
+			}
+		}
+
+		//With primary_ring_index set, now it's time to make the replicas.
+		//And, since the replication factor is 3, we need to make 2 replicas!
+		int replica_one_index;
+		int replica_two_index;
+
+		//Now in order to set the index of these two replicas, we have to determine the size of the ring.
+		if(ring.size() - primary_ring_index > 2)
+		{
+			replica_one_index = primary_ring_index + 1;
+			replica_two_index = primary_ring_index + 2;
+		}
+
+		else if(ring.size() - primary_ring_index == 2)
+		{
+			replica_one_index = primary_ring_index + 1;
+			replica_two_index = 0;
+		}
+
+		else if(ring.size() > 1)
+		{
+			replica_one_index = 0;
+			replica_two_index = 1;
+		}
+
+		else
+		{
+			replica_one_index = primary_ring_index;
+			replica_two_index = primary_ring_index;
+		}
+
+		cout << "DATA" << endl;
+		cout << ring.size() << endl;
+		cout << primary_ring_index << endl;
+		cout << replica_one_index << endl;
+		cout << replica_two_index << endl;
+
+		Message msg0(0, this->memberNode->addr, CREATE, key, val, PRIMARY);
+		emulNet->ENsend(&this->memberNode->addr, ring[primary_ring_index].getAddress(), msg0.toString());
+
+		Message msg1(0, this->memberNode->addr, CREATE, key, val, SECONDARY);
+		emulNet->ENsend(&this->memberNode->addr, ring[replica_one_index].getAddress(), msg1.toString());
+
+		Message msg2(0, this->memberNode->addr, CREATE, key, val, TERTIARY);
+		emulNet->ENsend(&this->memberNode->addr, ring[replica_two_index].getAddress(), msg2.toString());
+	}
+	*/
+}
